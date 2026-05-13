@@ -1,168 +1,91 @@
-import { supabase, requireUserId } from '../lib/supabase'
-import type {
-  Topic,
-  Lesson,
-  LessonWord,
-  LessonWithWords,
-  TopicWithLessons,
-  UserLessonProgress,
-} from '../types/database.types'
+import { supabase } from './supabase'
 
-export async function fetchTopics(): Promise<Topic[]> {
-  const { data, error } = await supabase
-    .from('topics')
-    .select('*')
-    .eq('is_active', true)
-    .order('order_index', { ascending: true })
-  if (error) throw new Error(`fetchTopics: ${error.message}`)
-  return data ?? []
+export interface Word {
+  id: string
+  lesson_id: string
+  english: string
+  hebrew: string
+  transliteration: string | null
+  example_sentence: string | null
+  example_translation: string | null
+  audio_url: string | null
+  order_index: number
 }
 
-export async function fetchTopicsWithLessons(): Promise<TopicWithLessons[]> {
-  const { data, error } = await supabase
-    .from('topics')
-    .select(`
-      *,
-      lessons (
-        id, slug, title_en, title_he, description_he,
-        difficulty, estimated_minutes, xp_reward, order_index, is_active
-      )
-    `)
-    .eq('is_active', true)
-    .order('order_index', { ascending: true })
-    .order('order_index', { ascending: true, referencedTable: 'lessons' })
-  if (error) throw new Error(`fetchTopicsWithLessons: ${error.message}`)
-  return (data ?? []) as unknown as TopicWithLessons[]
+export interface Lesson {
+  id: string
+  title: string
+  description: string | null
+  difficulty: string
+  xp_reward: number
+  order_index: number
 }
 
-export async function fetchLesson(lessonId: string): Promise<Lesson | null> {
+export async function getLessons(): Promise<Lesson[]> {
   const { data, error } = await supabase
     .from('lessons')
     .select('*')
-    .eq('id', lessonId)
-    .eq('is_active', true)
+    .order('order_index')
+  if (error) throw error
+  return data ?? []
+}
+
+export async function getLessonWords(lessonId: string): Promise<Word[]> {
+  const { data, error } = await supabase
+    .from('words')
+    .select('*')
+    .eq('lesson_id', lessonId)
+    .order('order_index')
+  if (error) throw error
+  return data ?? []
+}
+
+export async function saveProgress(userId: string, lessonId: string, score: number) {
+  const { error } = await supabase
+    .from('user_progress')
+    .upsert({
+      user_id: userId,
+      lesson_id: lessonId,
+      completed: true,
+      score,
+      completed_at: new Date().toISOString(),
+    })
+  if (error) throw error
+}
+
+export async function getUserProgress(userId: string) {
+  const { data, error } = await supabase
+    .from('user_progress')
+    .select('*')
+    .eq('user_id', userId)
+  if (error) throw error
+  return data ?? []
+}
+
+export async function getProfile(userId: string) {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('id', userId)
     .single()
-  if (error) {
-    if (error.code === 'PGRST116') return null
-    throw new Error(`fetchLesson: ${error.message}`)
-  }
+  if (error) return null
   return data
 }
 
-export async function fetchLessonWithWords(lessonId: string): Promise<LessonWithWords | null> {
-  const { data, error } = await supabase
-    .from('lessons')
-    .select(`
-      *,
-      lesson_words (
-        id, english_word, hebrew_translation, transliteration,
-        example_sentence_en, example_sentence_he, audio_url, image_emoji, order_index
-      )
-    `)
-    .eq('id', lessonId)
-    .eq('is_active', true)
-    .order('order_index', { ascending: true, referencedTable: 'lesson_words' })
-    .single()
-  if (error) {
-    if (error.code === 'PGRST116') return null
-    throw new Error(`fetchLessonWithWords: ${error.message}`)
+export async function awardXp(userId: string, xpAmount: number) {
+  try {
+    await supabase.rpc('award_xp', { user_id: userId, xp_amount: xpAmount })
+  } catch {
+    // fallback: update directly
+    const profile = await getProfile(userId)
+    if (profile) {
+      await supabase
+        .from('profiles')
+        .update({
+          xp: profile.xp + xpAmount,
+          lessons_completed: profile.lessons_completed + 1,
+        })
+        .eq('id', userId)
+    }
   }
-  return data as unknown as LessonWithWords
-}
-
-export async function fetchLessonWords(lessonId: string): Promise<LessonWord[]> {
-  const { data, error } = await supabase
-    .from('lesson_words')
-    .select('*')
-    .eq('lesson_id', lessonId)
-    .order('order_index', { ascending: true })
-  if (error) throw new Error(`fetchLessonWords: ${error.message}`)
-  return data ?? []
-}
-
-export async function fetchLessonsByTopic(topicId: string): Promise<Lesson[]> {
-  const { data, error } = await supabase
-    .from('lessons')
-    .select('*')
-    .eq('topic_id', topicId)
-    .eq('is_active', true)
-    .order('order_index', { ascending: true })
-  if (error) throw new Error(`fetchLessonsByTopic: ${error.message}`)
-  return data ?? []
-}
-
-export async function markLessonStarted(lessonId: string): Promise<void> {
-  const userId = await requireUserId()
-  const { error } = await supabase
-    .from('user_lesson_progress')
-    .upsert(
-      {
-        user_id:          userId,
-        lesson_id:        lessonId,
-        status:           'in_progress' as const,
-        first_started_at: new Date().toISOString(),
-      },
-      { onConflict: 'user_id,lesson_id', ignoreDuplicates: false },
-    )
-  if (error) throw new Error(`markLessonStarted: ${error.message}`)
-}
-
-export interface LessonCompletePayload {
-  lessonId:     string
-  wordsLearned: number
-  xpEarned:     number
-}
-
-export async function markLessonComplete(payload: LessonCompletePayload): Promise<void> {
-  const userId = await requireUserId()
-
-  const { error } = await supabase
-    .from('user_lesson_progress')
-    .upsert(
-      {
-        user_id:          userId,
-        lesson_id:        payload.lessonId,
-        status:           'completed' as const,
-        completion_count: 1,
-        total_xp_earned:  payload.xpEarned,
-        completed_at:     new Date().toISOString(),
-      },
-      { onConflict: 'user_id,lesson_id' },
-    )
-  if (error) throw new Error(`markLessonComplete: ${error.message}`)
-
-  const { error: xpError } = await supabase.rpc('award_xp', {
-    p_user_id:            userId,
-    p_amount:             payload.xpEarned,
-    p_source_type:        'lesson_complete' as const,
-    p_source_entity_type: 'lesson',
-    p_source_entity_id:   payload.lessonId,
-  })
-  if (xpError) throw new Error(`markLessonComplete XP: ${xpError.message}`)
-}
-
-export async function fetchUserLessonProgress(userId: string): Promise<UserLessonProgress[]> {
-  const { data, error } = await supabase
-    .from('user_lesson_progress')
-    .select('*')
-    .eq('user_id', userId)
-  if (error) throw new Error(`fetchUserLessonProgress: ${error.message}`)
-  return data ?? []
-}
-
-export async function fetchSingleLessonProgress(
-  userId:   string,
-  lessonId: string,
-): Promise<UserLessonProgress | null> {
-  const { data, error } = await supabase
-    .from('user_lesson_progress')
-    .select('*')
-    .eq('user_id', userId)
-    .eq('lesson_id', lessonId)
-    .single()
-  if (error) {
-    if (error.code === 'PGRST116') return null
-    throw new Error(`fetchSingleLessonProgress: ${error.message}`)
-  }
-  return data
 }
